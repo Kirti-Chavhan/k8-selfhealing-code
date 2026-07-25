@@ -1,0 +1,19 @@
+# Python virtual environment
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+
+# Editor / tooling
+.claude/
+
+# Runtime output
+logs/
+
+# Regenerable ML artifacts (produced by `python main.py --train`)
+models/*.pkl
+models/training_data.csv
