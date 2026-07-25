@@ -24,6 +24,7 @@ and the reasoning behind the key design decisions.
 2. [Repository layout](#repository-layout)
 3. [Part A — The application (My Task Flow)](#part-a--the-application-my-task-flow)
 4. [Part B — The self-healing engine](#part-b--the-self-healing-engine)
+5. [Self-healing in depth](#self-healing-in-depth)
 5. [The AI models](#the-ai-models)
 6. [Kubernetes manifests](#kubernetes-manifests)
 7. [Setup and run (end to end)](#setup-and-run-end-to-end)
@@ -322,6 +323,166 @@ once the pod has regressed from a previously-Ready state; a pod that crash-loops
 from birth is still caught by the restart-count spike.
 
 ---
+
+## Self-healing in depth
+
+Self-healing is the core of this project: the system **observes** the workload,
+**detects** abnormal behaviour on its own, **decides** the right remedy, **acts**
+through the Kubernetes API, and **records** the outcome — all without a human in
+the loop. The goal is to minimise **MTTR** (mean time to recovery).
+
+### The healing lifecycle (one full cycle, every 30s)
+
+```
+        ┌────────────┐   Prometheus (CPU/mem)  +  K8s API (restarts/ready)
+        │  OBSERVE   │◄───────────────────────────────────────────────────┐
+        └─────┬──────┘                                                     │
+              ▼                                                            │
+        ┌────────────┐   Layer 1 Z-Score  ─┐                              │
+        │   DETECT   │   Layer 2 Iso.Forest ├─► anomaly?                   │
+        │            │   Layer 2b Health gate┘                            │
+        └─────┬──────┘                                                     │
+              ▼                                                            │
+        ┌────────────┐   Random Forest picks an action (>= 70% confidence) │
+        │   DECIDE   │   act only if: anomaly AND action != NO_ACTION      │
+        │            │                AND pod not in cooldown              │
+        └─────┬──────┘                                                     │
+              ▼                                                            │
+        ┌────────────┐   SCALE_UP | ROLLING_RESTART | DELETE_AND_RECREATE  │
+        │    ACT     │   via the Kubernetes API                            │
+        └─────┬──────┘                                                     │
+              ▼                                                            │
+        ┌────────────┐   append row to logs/healing_actions.csv (+ MTTR)   │
+        │  LOG/LEARN │───────────────────────────────────────────────────►┘
+        └────────────┘   (feedback dataset for future retraining)
+```
+
+Code path: `main.py --run` -> `SelfHealingEngine.run()`
+(`healing/self_healing_engine.py:118`) -> for each pod `process_pod(row)`
+(`self_healing_engine.py:53`).
+
+### Why three detectors plus a rule (defence in depth)
+
+No single detector catches every failure mode, so the engine combines
+complementary signals. Each answers a different question:
+
+**Layer 1 — Z-Score (`ai/zscore_predictor.py`)**
+Keeps a rolling window (size `ZSCORE_WINDOW_SIZE`, default 20) of each pod's CPU
+and memory. For a new reading `x` it computes `z = (x - mean) / std`; if
+`|z| > ZSCORE_THRESHOLD` (default 2.5) it raises a warning. It detects a **spike
+relative to that pod's own recent baseline** — e.g. a pod that normally sits at
+5% CPU suddenly jumping to 45%. It reacts fast and is pod-specific, but needs a
+few samples of history to be meaningful.
+
+**Layer 2 — Isolation Forest (`ai/isolation_forest_detector.py`)**
+An unsupervised anomaly detector trained only on *healthy* samples. It isolates
+outliers by random partitioning (fewer splits to isolate = more anomalous), with
+`IF_CONTAMINATION` (0.05) setting the outlier threshold. It detects **absolute
+resource anomalies** — e.g. memory at 90% is abnormal regardless of the pod's
+own history. It looks at **CPU and memory only** (see design note below).
+
+**Layer 2b — Explicit health gate (`self_healing_engine.py:73-86`)**
+A deterministic rule, not a model. It fires on:
+- `restart_spike` — `restart_count` increased since the previous poll (the
+  container was restarted, e.g. by a failing liveness probe), or
+- `not_ready_regression` — the pod was Ready before and is now not-ready.
+
+These are the crash / hang / stuck signals that do **not** show up in CPU/mem.
+
+**Layer 3 — Random Forest (`ai/random_forest_classifier.py`)**
+A supervised classifier trained on four labelled classes (healthy, CPU overload,
+memory pressure, crash). Given `cpu, memory, restart_count, pod_ready` it outputs
+**which action** to take and a **confidence**. It only counts if confidence
+>= `RF_CONFIDENCE_MIN` (0.70).
+
+### The decision gate (`self_healing_engine.py:92`)
+
+```python
+should_act = zscore_warn or if_anomaly or health_degraded      # "is something wrong?"
+if should_act and rf_action != NO_ACTION and not in_cooldown:  # "and what do we do?"
+    execute(rf_action, pod)
+```
+
+This is a deliberate **two-key rule**: one set of signals decides *that* a pod is
+unhealthy (any of Z-Score / Isolation Forest / health gate), and a separate model
+decides *what* to do (Random Forest). A single noisy reading cannot cause an
+action on its own — the classifier must also agree with a concrete, confident
+remedy. The per-pod `COOLDOWN_SECONDS` (180s) then prevents repeated action on
+the same pod while a fix takes effect.
+
+### The three healing actions (`healing/kubernetes_actions.py`)
+
+| Action | Trigger (typical) | What the engine does | K8s effect |
+|--------|-------------------|----------------------|-----------|
+| **SCALE_UP** | Sustained high CPU | `scale_up_deployment()` patches `spec.replicas` +1 (capped at `MAX_REPLICAS`) | A new replica is scheduled to share load |
+| **ROLLING_RESTART** | Memory pressure / leak | `rolling_restart_deployment()` patches a `kubectl.kubernetes.io/restartedAt` annotation on the pod template | Deployment does a **zero-downtime** rolling update (`maxUnavailable: 0, maxSurge: 1`) — new pods come up before old ones go |
+| **DELETE_AND_RECREATE** | Crash / stuck / not-ready | `delete_pod()` deletes the pod (grace period 0) | The Deployment's ReplicaSet immediately recreates a fresh pod |
+
+### MTTR and the feedback loop
+
+When an action succeeds, the engine records **MTTR** (time to execute the
+remedy) and appends a full row to `logs/healing_actions.csv`
+(`healing/feedback_logger.py`). Every poll logs one row per pod — including
+`NO_ACTION` — so the CSV is both an audit trail and a labelled dataset that can be
+fed back into `--train` to improve the models over time.
+
+### Worked examples (from real demo runs)
+
+**1) Memory pressure -> ROLLING_RESTART.** A pod's memory was driven to ~90%.
+The Isolation Forest flagged it; the Random Forest chose `ROLLING_RESTART`; the
+healthy sibling pod was untouched:
+```
+pod    cpu    mem     rst rdy  if_anomaly  rf_action        conf  taken            mttr
+q2t25  0.32   90.41   1   1    True        ROLLING_RESTART  0.96  ROLLING_RESTART  0.02s   <- healed
+fp6m2  0.20   20.58   0   1    False       NO_ACTION        1.00  NO_ACTION        -       <- left alone
+```
+New pods from a fresh ReplicaSet replaced the stressed pods with **zero
+downtime**.
+
+**2) Crash -> DELETE_AND_RECREATE.** `/health` was forced to 503. Kubernetes'
+liveness probe restarted the container (restart_count 0->1, briefly not-ready).
+Note the resource metrics are **normal** — the Isolation Forest correctly stayed
+silent; the **health gate** drove the action:
+```
+pod    cpu    mem     rst rdy  if_anomaly  rf_action            conf  taken                mttr
+7jdnp  0.21   20.59   1   0    False       DELETE_AND_RECREATE  0.95  DELETE_AND_RECREATE  0.02s
+```
+
+**3) CPU overload -> HPA (not the AI).** Under CPU stress the pod's `cpu_percent`
+plateaued near ~46% because the container's CPU **limit is 500m** (`rate*100`
+caps around 50%), which is below the Random Forest's overload profile (~88%). So
+the AI `SCALE_UP` did not fire; the native **HorizontalPodAutoscaler** scaled the
+Deployment 2 -> 5 instead. To demo the AI scale-up path, raise the CPU limit so
+`cpu_percent` can exceed the overload threshold.
+
+### AI self-healing vs. Kubernetes' native self-healing
+
+Kubernetes already self-heals in basic ways; this engine **adds a layer on top**:
+
+| Concern | Kubernetes native | This AI engine adds |
+|---------|-------------------|---------------------|
+| Dead container | Liveness probe restarts it | Detects the restart and can escalate to `DELETE_AND_RECREATE` |
+| Not-ready pod | Removed from Service endpoints | Treats a *regression* to not-ready as a fault to remediate |
+| High CPU | HPA scales on CPU vs. request | Multi-signal detection; chooses among several remedies |
+| Memory leak | (no native remedy) | `ROLLING_RESTART` to clear it before OOM |
+| Which fix to apply | n/a | Random Forest classifier picks the action |
+| Audit / MTTR / learning | limited | Full CSV log + feedback dataset |
+
+Because both loops act on the same pods, the engine is intentionally designed
+**not to fight** Kubernetes — e.g. it does not treat freshly-created (still
+starting) pods as crashed (see the health-gate design note).
+
+### Tuning the healing behaviour (`config.py`)
+
+| Knob | Effect on healing |
+|------|-------------------|
+| `POLL_INTERVAL_SECONDS` | How quickly faults are detected (lower = faster, noisier) |
+| `COOLDOWN_SECONDS` | Minimum gap between actions on the same pod |
+| `ZSCORE_THRESHOLD` / `ZSCORE_WINDOW_SIZE` | Sensitivity of the spike detector |
+| `IF_CONTAMINATION` | How aggressively the Isolation Forest flags anomalies |
+| `RF_CONFIDENCE_MIN` | Minimum confidence before an action is taken |
+| `MAX_REPLICAS` | Upper bound for `SCALE_UP` |
+
 
 ## The AI models
 
