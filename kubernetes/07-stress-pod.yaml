@@ -1,0 +1,40 @@
+# In-cluster helper pod for driving the task-manager app's /stress/* endpoints.
+# The app itself generates the load (CPU burn, memory fill, forced 503s); this
+# pod just needs to reach the ClusterIP service, so a plain curl image is enough.
+#
+# Deploy:
+#   kubectl apply -f kubernetes/07-stress-pod.yaml
+#
+# Trigger a scenario (service DNS resolves within the default namespace):
+#   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/cpu
+#   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/memory
+#   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/crash
+#   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/not-ready
+#   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/reset
+#
+# Note: /stress/crash and /stress/not-ready flip a per-worker flag, and the app
+# runs 2 gunicorn workers behind the service, so repeat the call a few times to
+# flip every worker before the liveness/readiness probe fails consistently.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stress-tester
+  namespace: default
+  labels:
+    app: stress-tester
+    purpose: load-generation
+spec:
+  restartPolicy: Never
+  containers:
+  - name: curl
+    image: curlimages/curl:8.11.1
+    imagePullPolicy: IfNotPresent
+    # Keep the pod alive so it can be exec'd repeatedly.
+    command: ["sleep", "infinity"]
+    resources:
+      requests:
+        cpu: "10m"
+        memory: "16Mi"
+      limits:
+        cpu: "50m"
+        memory: "32Mi"
