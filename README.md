@@ -30,6 +30,7 @@ and the reasoning behind the key design decisions.
 7. [Setup and run (end to end)](#setup-and-run-end-to-end)
 8. [Using the web app](#using-the-web-app)
 9. [Triggering faults (demo scenarios)](#triggering-faults-demo-scenarios)
+10. [Demo script (for presenting)](#demo-script-for-presenting)
 10. [Observability](#observability)
 11. [Configuration](#configuration)
 12. [Environment notes (corporate network / Zscaler)](#environment-notes-corporate-network--zscaler)
@@ -611,6 +612,54 @@ in a single call (no need to repeat).
 
 ---
 
+## Demo script (for presenting)
+
+A ~5-minute walkthrough that shows the app **and** the self-healing.
+
+**Prep (before the audience):**
+```bash
+# 3 port-forwards + the engine (each in its own terminal so logs are visible)
+kubectl port-forward -n monitoring svc/prometheus 9090:9090 &
+kubectl port-forward -n default    svc/task-manager 8080:80 &
+kubectl port-forward -n monitoring svc/grafana      3000:3000 &
+python main.py --run          # engine terminal (keep visible)
+```
+Open three tabs: the app (`http://localhost:8080`), the Grafana dashboard
+(`http://localhost:3000/d/selfhealing`, admin/admin123), and the engine terminal.
+Keep a spare terminal for stress commands and `kubectl` watch.
+
+**Script:**
+1. **Show the app.** "This is *My Task Flow*, a Flask app running as pods in
+   Kubernetes." Add a task, complete one, use the filters. Point at the footer:
+   "served by `<pod-name>`".
+2. **Show the engine.** "A separate AI engine polls those pods every 30s." Point
+   at `Collected metrics for N pod(s)`.
+3. **Show Grafana.** Per-pod CPU/memory, running-pods count, request rate — all
+   flat/healthy right now.
+4. **Break it (memory):**
+   ```bash
+   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/memory
+   kubectl get pods -n default -l app=task-manager -w   # in another pane
+   ```
+5. **Narrate the heal (~30–60s):** the engine logs
+   `ALERT ... ROLLING_RESTART`; the Grafana **memory panel spikes then drops**;
+   pods **roll to new names with zero downtime**; the app stays usable; reload it
+   and the "served by" pod has changed — proof it recovered.
+6. **Show the evidence:** `tail -f logs/healing_actions.csv` — the row with
+   `if_anomaly`, `rf_action=ROLLING_RESTART`, confidence and `mttr_seconds`.
+7. **(Optional) Crash:**
+   `kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/crash`
+   → the engine's **health gate** fires `DELETE_AND_RECREATE`; the pod is
+   recreated. Note CPU/mem stay normal here — this fault is caught by the health
+   gate, not the models.
+8. **Wrap up:** recap the three detectors + the two-key decision gate, and that
+   the whole thing runs unattended.
+
+**Reset between runs:**
+```bash
+kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/reset
+```
+
 ## Observability
 
 On the Docker driver these NodePorts are not directly routable from the host;
@@ -623,6 +672,33 @@ use `kubectl port-forward` (or `minikube service <name> -n monitoring --url`).
 | Grafana | 30030 | `kubectl port-forward -n monitoring svc/grafana 3000:3000` (admin/admin123) |
 
 ---
+
+### Self-healing Grafana dashboard
+
+A ready-made dashboard is **provisioned automatically** — the Prometheus
+datasource and the dashboard are defined in `kubernetes/08-grafana-dashboard.yaml`
+and mounted into Grafana by `kubernetes/06-grafana-deploy.yaml`. No manual import
+needed.
+
+```bash
+kubectl port-forward -n monitoring svc/grafana 3000:3000
+# open http://localhost:3000/d/selfhealing   (admin / admin123)
+```
+
+Panels (all from Prometheus):
+
+| Panel | What it shows during a demo |
+|-------|-----------------------------|
+| **Per-pod CPU %** | Jumps during CPU stress |
+| **Per-pod Memory % of 256Mi** | Climbs during memory stress, **drops after a rolling restart** |
+| **Running pods** | Increases on `SCALE_UP`; changes as pods roll / are recreated |
+| **Tasks in store** | Live app state |
+| **HTTP request rate by status** | Traffic + any 5xx during disruption |
+| **p95 latency / Error rate** | Impact on the app while a pod is unhealthy |
+
+The dashboard visualizes the **effects** of healing (recovery, pod turnover) from
+Prometheus. The healing **decisions** themselves (which action, confidence, MTTR)
+are recorded in `logs/healing_actions.csv` — see the feedback log.
 
 ## Configuration
 
