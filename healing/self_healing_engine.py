@@ -29,6 +29,7 @@ class SelfHealingEngine:
         self.feedback = FeedbackLogger()
         self.cooldowns = {}       # {pod_name: unix_timestamp_of_last_action}
         self.last_restarts = {}   # {pod_name: restart_count seen on previous poll}
+        self.seen_ready = set()   # pods observed Ready at least once
 
     def load_models(self):
         logger.info("Loading AI models from disk...")
@@ -73,7 +74,16 @@ class SelfHealingEngine:
         prev_restarts  = self.last_restarts.get(pod)
         restart_spike  = prev_restarts is not None and restarts > prev_restarts
         self.last_restarts[pod] = restarts
-        health_degraded = (ready == 0) or restart_spike
+
+        # A pod that is not-ready but has never *been* ready is still starting up
+        # (e.g. just created by a scale-up), not a fault — otherwise we would
+        # delete healthy pods mid-startup and fight the HPA. Only count
+        # not-ready as degraded once the pod has regressed from a Ready state.
+        # A pod that crash-loops from birth is still caught by restart_spike.
+        if ready == 1:
+            self.seen_ready.add(pod)
+        not_ready_regression = (ready == 0) and (pod in self.seen_ready)
+        health_degraded = not_ready_regression or restart_spike
 
         # ── Layer 3: Random Forest ────────────────────────────────────
         rf_action, rf_conf = self.rf.predict(cpu, memory, restarts, ready)
