@@ -1,7 +1,7 @@
 import time
 import logging
 from config import (
-    TARGET_DEPLOYMENT, POLL_INTERVAL_SECONDS, COOLDOWN_SECONDS,
+    TARGET_DEPLOYMENT, POLL_INTERVAL_SECONDS, COOLDOWN_SECONDS, MAX_REPLICAS,
     ACTION_SCALE_UP, ACTION_DELETE_RECREATE, ACTION_ROLLING_RESTART, ACTION_NO_ACTION
 )
 from ai.data_collector import collect_all_metrics
@@ -85,11 +85,23 @@ class SelfHealingEngine:
         not_ready_regression = (ready == 0) and (pod in self.seen_ready)
         health_degraded = not_ready_regression or restart_spike
 
+        # A pod that has never been Ready yet is still starting up (e.g. a
+        # fresh pod from a rolling restart or scale-up): Prometheus usually
+        # hasn't scraped it yet, so cpu/memory read as 0, which the Isolation
+        # Forest has never seen as "normal" and flags as anomalous — and the
+        # Random Forest, never having seen ready=0 in a healthy sample,
+        # confidently recommends DELETE_AND_RECREATE. Left unguarded, this
+        # makes the engine delete its own still-starting pods and fight its
+        # own rolling restarts / scale-ups. So the statistical/ML signals are
+        # suppressed while starting_up; a genuine crash-from-birth is still
+        # caught via restart_spike (already inside health_degraded).
+        starting_up = (ready == 0) and (pod not in self.seen_ready)
+
         # ── Layer 3: Random Forest ────────────────────────────────────
         rf_action, rf_conf = self.rf.predict(cpu, memory, restarts, ready)
 
         # ── Decision ─────────────────────────────────────────────────
-        should_act   = zscore_warn or if_anomaly or health_degraded
+        should_act   = health_degraded or (not starting_up and (zscore_warn or if_anomaly))
         action_taken = ACTION_NO_ACTION
         mttr         = None
 
@@ -118,7 +130,7 @@ class SelfHealingEngine:
     def run(self):
         load_kube_config()
         logger.info(f"Self-Healing Engine running — polling every {POLL_INTERVAL_SECONDS}s")
-        logger.info(f"Cooldown: {COOLDOWN_SECONDS}s | Max replicas: {TARGET_DEPLOYMENT}")
+        logger.info(f"Cooldown: {COOLDOWN_SECONDS}s | Max replicas: {MAX_REPLICAS}")
 
         while True:
             try:

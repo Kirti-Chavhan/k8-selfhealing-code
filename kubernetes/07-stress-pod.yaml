@@ -12,9 +12,8 @@
 #   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/not-ready
 #   kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/reset
 #
-# Note: /stress/crash and /stress/not-ready flip a per-worker flag, and the app
-# runs 2 gunicorn workers behind the service, so repeat the call a few times to
-# flip every worker before the liveness/readiness probe fails consistently.
+# Note: the app runs a single gunicorn worker (see app/Dockerfile), so one
+# call to /stress/crash or /stress/not-ready is enough to flip its state.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -25,12 +24,22 @@ metadata:
     purpose: load-generation
 spec:
   restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 100
+    seccompProfile:
+      type: RuntimeDefault
   containers:
   - name: curl
     image: curlimages/curl:8.11.1
     imagePullPolicy: IfNotPresent
     # Keep the pod alive so it can be exec'd repeatedly.
     command: ["sleep", "infinity"]
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
     resources:
       requests:
         cpu: "10m"

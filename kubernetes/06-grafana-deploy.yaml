@@ -1,3 +1,17 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-admin-credentials
+  namespace: monitoring
+type: Opaque
+stringData:
+  # Override before applying in any shared/real environment, e.g.:
+  #   kubectl create secret generic grafana-admin-credentials -n monitoring \
+  #     --from-literal=admin-user=admin --from-literal=admin-password=<your-password> \
+  #     --dry-run=client -o yaml | kubectl apply -f -
+  admin-user: "admin"
+  admin-password: "admin123"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,9 +37,15 @@ spec:
         - containerPort: 3000
         env:
         - name: GF_SECURITY_ADMIN_USER
-          value: "admin"
+          valueFrom:
+            secretKeyRef:
+              name: grafana-admin-credentials
+              key: admin-user
         - name: GF_SECURITY_ADMIN_PASSWORD
-          value: "admin123"
+          valueFrom:
+            secretKeyRef:
+              name: grafana-admin-credentials
+              key: admin-password
         - name: GF_USERS_ALLOW_SIGN_UP
           value: "false"
         resources:

@@ -11,6 +11,9 @@ __pycache__/
 # Editor / tooling
 .claude/
 
+# Test artifacts
+.pytest_cache/
+
 # Runtime output
 logs/
 

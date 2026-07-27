@@ -12,65 +12,28 @@ independent parts that run together:
 Metrics come from **Prometheus**; healing actions are performed through the
 **Kubernetes API**.
 
-This README is written as a **handover document**: it explains what the code
-does, how each part works, exactly *where* each thing is written (file and line),
-and the reasoning behind the key design decisions.
+**For the system architecture diagram, the healing-lifecycle sequence diagram,
+and the full step-by-step guide to running every service locally (in order, with
+expected output at each step) — see [`ARCHITECTURE.md`](ARCHITECTURE.md).** That
+document also has the live feature-verification checklist and an explicit list
+of what "production ready" does and doesn't cover here.
 
 ---
 
 ## Table of contents
 
-1. [Architecture at a glance](#architecture-at-a-glance)
-2. [Repository layout](#repository-layout)
-3. [Part A — The application (My Task Flow)](#part-a--the-application-my-task-flow)
-4. [Part B — The self-healing engine](#part-b--the-self-healing-engine)
-5. [Self-healing in depth](#self-healing-in-depth)
-5. [The AI models](#the-ai-models)
-6. [Kubernetes manifests](#kubernetes-manifests)
-7. [Setup and run (end to end)](#setup-and-run-end-to-end)
-8. [Using the web app](#using-the-web-app)
-9. [Triggering faults (demo scenarios)](#triggering-faults-demo-scenarios)
+1. [Repository layout](#repository-layout)
+2. [Part A — The application (My Task Flow)](#part-a--the-application-my-task-flow)
+3. [Part B — The self-healing engine (summary)](#part-b--the-self-healing-engine-summary)
+4. [The AI models](#the-ai-models)
+5. [Kubernetes manifests](#kubernetes-manifests)
+6. [Quick start](#quick-start)
+7. [Using the web app](#using-the-web-app)
+8. [Triggering faults (demo scenarios)](#triggering-faults-demo-scenarios)
+9. [Testing](#testing)
 10. [Demo script (for presenting)](#demo-script-for-presenting)
-10. [Observability](#observability)
 11. [Configuration](#configuration)
-12. [Environment notes (corporate network / Zscaler)](#environment-notes-corporate-network--zscaler)
-13. [Troubleshooting](#troubleshooting)
-14. [Known limitations and future work](#known-limitations-and-future-work)
-
----
-
-## Architecture at a glance
-
-```
-                          YOUR MACHINE (host)
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Browser  ──HTTP──►  http://localhost:8080  (kubectl port-fwd)│
-  │                                                               │
-  │  Self-Healing Engine  (python main.py --run)                  │
-  │     reads metrics ◄── http://localhost:9090 (Prometheus pf)   │
-  │     sends actions ──► Kubernetes API (kubeconfig)             │
-  └───────────────┬───────────────────────────────┬──────────────┘
-                  │                                │
-                  ▼                                ▼
-                       minikube CLUSTER
-  ┌──────────────────────────────────────────────────────────────┐
-  │  namespace: default                                           │
-  │     Deployment task-manager  (2+ pods, "My Task Flow" app)    │
-  │     Service task-manager (ClusterIP/NodePort)                 │
-  │     HorizontalPodAutoscaler (native k8s CPU autoscaling)      │
-  │     Pod stress-tester (helper to trigger faults)              │
-  │                                                               │
-  │  namespace: monitoring                                        │
-  │     Prometheus  (scrapes pod CPU/mem via cAdvisor)            │
-  │     Grafana     (dashboards)                                  │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-Two control loops act on the workload:
-- **The AI engine** (this project) — detects anomalies and heals.
-- **Kubernetes itself** — liveness/readiness probes restart/again-route pods, and
-  the HPA scales on CPU. The AI engine is designed to *complement* these, not
-  fight them (see the health-gate design note below).
+12. [Known limitations and future work](#known-limitations-and-future-work)
 
 ---
 
@@ -85,6 +48,7 @@ app/                          # THE WEB APPLICATION ("My Task Flow")
   metrics.py                  # Prometheus metric definitions used by app.py
   Dockerfile                  # Builds the app image (gunicorn, 1 worker)
   requirements.txt            # App-only deps: flask, gunicorn, prometheus-client
+  .dockerignore
 
 ai/                           # DETECTION MODELS + DATA
   data_collector.py           # Reads CPU/mem from Prometheus + restarts/ready from K8s API
@@ -99,18 +63,24 @@ healing/                      # THE ENGINE + ACTIONS
   kubernetes_actions.py       # scale_up / delete_pod / rolling_restart via K8s API
   feedback_logger.py          # Appends every decision to logs/healing_actions.csv
 
-kubernetes/                   # Cluster manifests, applied in numeric order 01 -> 07
+kubernetes/                   # Cluster manifests, applied in numeric order 01 -> 08
   01-namespace.yaml           # monitoring namespace
-  02-app-deployment.yaml      # task-manager Deployment + Service + HPA
+  02-app-deployment.yaml      # task-manager Deployment (securityContext hardened) + Service + HPA
   03-prometheus-rbac.yaml     # Prometheus ServiceAccount/ClusterRole
   04-prometheus-config.yaml   # Prometheus scrape config
   05-prometheus-deploy.yaml   # Prometheus Deployment + NodePort Service
-  06-grafana-deploy.yaml      # Grafana Deployment + NodePort Service
-  07-stress-pod.yaml          # curl helper pod to trigger /stress/* endpoints
+  06-grafana-deploy.yaml      # Grafana admin-credentials Secret + Deployment + Service
+  07-stress-pod.yaml          # curl helper pod to trigger /stress/* endpoints (securityContext hardened)
+  08-grafana-dashboard.yaml   # Self-healing Grafana dashboard, provisioned automatically
+
+tests/                        # pytest suite — Flask API + healing decision logic, no cluster needed
+  test_app.py
+  test_healing_logic.py
 
 models/                       # Trained artifacts (.pkl) + training_data.csv  [git-ignored, regenerate with --train]
 logs/                         # healing_actions.csv feedback log              [git-ignored]
-requirements.txt              # Engine deps (scikit-learn, kubernetes, pandas, flask, ...)
+requirements.txt              # Engine deps (scikit-learn, kubernetes, pandas, joblib, requests, pytest)
+ARCHITECTURE.md                # Diagrams, full runbook, verification checklist, production-readiness notes
 ```
 
 ---
@@ -224,266 +194,32 @@ gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 120 app:app
 another (they appear to vanish on reload). One worker = one consistent in-memory
 store. (Multiple threads still handle concurrency.)
 
-The Deployment uses `image: task-manager:latest` with `imagePullPolicy: Never`,
-so the image must be **built into minikube's own Docker daemon** (see setup).
+The Deployment uses `image: task-manager:1.0.0` with `imagePullPolicy: Never`,
+so the image must be **built into minikube's own Docker daemon** (see
+[quick start](#quick-start)) — pinned to a real tag rather than a floating
+`:latest`, and running under a non-root `securityContext`.
 
 ---
 
-## Part B — The self-healing engine
+## Part B — The self-healing engine (summary)
 
-Entry point: `python main.py --run` -> constructs `SelfHealingEngine`
-(`healing/self_healing_engine.py:24`) and calls `.run()`.
+Entry point: `python main.py --run` → `SelfHealingEngine.run()`
+(`healing/self_healing_engine.py:118`) loops every `POLL_INTERVAL_SECONDS`
+(default 30s): collect metrics for every pod → run three detectors (Z-Score,
+Isolation Forest, an explicit health gate) → a Random Forest picks the healing
+action → act only if some detector flagged an anomaly **and** the classifier
+agrees on a confident action **and** the pod isn't in cooldown → log the
+decision (and MTTR) to `logs/healing_actions.csv`.
 
-### The control loop
+Actions available: `SCALE_UP` (CPU overload), `ROLLING_RESTART` (memory
+pressure, zero-downtime), `DELETE_AND_RECREATE` (crash/stuck pod).
 
-`SelfHealingEngine.run()` (`self_healing_engine.py:118`) loops forever, every
-`POLL_INTERVAL_SECONDS` (default 30):
-
-1. `collect_all_metrics()` gathers per-pod metrics.
-2. For each pod, `process_pod(row)` runs the detection pipeline and, if needed,
-   executes a healing action.
-3. Sleeps and repeats.
-
-### Metric collection
-
-`ai/data_collector.py` builds one row per pod with:
-`pod_name, cpu_percent, memory_percent, restart_count, pod_ready`.
-
-- **CPU / memory** come from **Prometheus** (cAdvisor metrics):
-  `rate(container_cpu_usage_seconds_total[2m]) * 100` and
-  `container_memory_working_set_bytes` (converted to % of the 256Mi limit).
-- **restart_count / pod_ready** come from the **Kubernetes API** directly.
-
-### The detection pipeline (in `process_pod`, `self_healing_engine.py:53`)
-
-| Layer | Where | What it decides |
-|-------|-------|-----------------|
-| **1. Z-Score** (`ai/zscore_predictor.py`) | called at line 60 | Is CPU/mem a spike vs. this pod's own recent history? Sets `zscore_warn`. |
-| **2. Isolation Forest** (`ai/isolation_forest_detector.py`) | line 67 `iso.predict(cpu, memory)` | Is resource usage anomalous? Sets `if_anomaly`. **CPU/mem only.** |
-| **2b. Explicit health gate** | lines 73–86 | Deterministic fault check: a restart-count **increase** since last poll (`restart_spike`), OR a pod that **regressed** from Ready to not-ready (`not_ready_regression`). Sets `health_degraded`. |
-| **3. Random Forest** (`ai/random_forest_classifier.py`) | line 88 `rf.predict(...)` | Which action fits? Returns `rf_action` + confidence. |
-
-### The decision rule (`self_healing_engine.py:92`)
-
-```python
-should_act = zscore_warn or if_anomaly or health_degraded
-if should_act and rf_action != NO_ACTION and not in_cooldown(pod):
-    execute(rf_action, pod)
-```
-
-An action fires only when **(some detector flags an anomaly) AND (the Random
-Forest recommends a real action, above RF_CONFIDENCE_MIN) AND (the pod is not in
-cooldown)**. This "two-key" design stops a single noisy signal from acting alone.
-
-### Healing actions (`healing/kubernetes_actions.py`)
-
-| Action                | Function                     | Effect |
-|-----------------------|------------------------------|--------|
-| `SCALE_UP`            | `scale_up_deployment`        | +1 replica up to `MAX_REPLICAS` (CPU overload) |
-| `ROLLING_RESTART`     | `rolling_restart_deployment` | Patches a restart annotation -> zero-downtime roll (memory leak) |
-| `DELETE_AND_RECREATE` | `delete_pod`                 | Deletes the pod; the Deployment recreates it (crash/stuck) |
-
-After acting, the pod enters a `COOLDOWN_SECONDS` (default 180s) window so the
-engine does not repeatedly hit the same pod.
-
-### Feedback log
-
-Every poll, `healing/feedback_logger.py` appends one row per pod to
-`logs/healing_actions.csv`. Columns:
-
-```
-timestamp, pod_name, cpu_percent, memory_percent, restart_count, pod_ready,
-zscore_cpu, zscore_memory, zscore_warning, if_anomaly, if_score,
-rf_action, rf_confidence, action_taken, mttr_seconds
-```
-
-This is both an audit trail and a dataset for future model retraining.
-
-### Key design decisions (the "why")
-
-**1. The Isolation Forest only looks at CPU/memory.**
-Originally it was fed all four features (incl. `pod_ready`, `restart_count`) and
-flagged *every* pod as anomalous. Two reasons: (a) the healthy training data
-centered CPU around 35% while real pods idle near 0%, so idle pods looked like
-outliers; (b) a single binary signal like `pod_ready` gets **averaged away**
-across four features in a density model — a grid search showed crash detection
-capped around ~54% (a coin flip). Fix: the Isolation Forest now models only the
-continuous resource metrics it is actually good at (CPU/mem), and the healthy
-training class was widened to cover the realistic idle->moderate range.
-
-**2. Discrete health faults are gated explicitly (Layer 2b), not by ML.**
-`pod_ready == 0` and restart spikes are deterministic, so they are checked with
-plain logic instead of a model.
-
-**3. Not-ready is only a fault after a pod has *been* ready.**
-`self_healing_engine.py:84-86` tracks a `seen_ready` set. A brand-new pod that is
-still starting up (e.g. one the HPA just created) is not-ready but has never been
-ready — treating that as a crash caused the engine to **delete healthy starting
-pods and fight the autoscaler**. Now not-ready only counts as `health_degraded`
-once the pod has regressed from a previously-Ready state; a pod that crash-loops
-from birth is still caught by the restart-count spike.
+**For the full detection pipeline, the decision-gate code, the `starting_up`
+guard (and the real bug it fixes), worked examples from live runs, and the
+comparison with Kubernetes' own native self-healing — see
+[`ARCHITECTURE.md`](ARCHITECTURE.md#healing-lifecycle-sequence-diagram).**
 
 ---
-
-## Self-healing in depth
-
-Self-healing is the core of this project: the system **observes** the workload,
-**detects** abnormal behaviour on its own, **decides** the right remedy, **acts**
-through the Kubernetes API, and **records** the outcome — all without a human in
-the loop. The goal is to minimise **MTTR** (mean time to recovery).
-
-### The healing lifecycle (one full cycle, every 30s)
-
-```
-        ┌────────────┐   Prometheus (CPU/mem)  +  K8s API (restarts/ready)
-        │  OBSERVE   │◄───────────────────────────────────────────────────┐
-        └─────┬──────┘                                                     │
-              ▼                                                            │
-        ┌────────────┐   Layer 1 Z-Score  ─┐                              │
-        │   DETECT   │   Layer 2 Iso.Forest ├─► anomaly?                   │
-        │            │   Layer 2b Health gate┘                            │
-        └─────┬──────┘                                                     │
-              ▼                                                            │
-        ┌────────────┐   Random Forest picks an action (>= 70% confidence) │
-        │   DECIDE   │   act only if: anomaly AND action != NO_ACTION      │
-        │            │                AND pod not in cooldown              │
-        └─────┬──────┘                                                     │
-              ▼                                                            │
-        ┌────────────┐   SCALE_UP | ROLLING_RESTART | DELETE_AND_RECREATE  │
-        │    ACT     │   via the Kubernetes API                            │
-        └─────┬──────┘                                                     │
-              ▼                                                            │
-        ┌────────────┐   append row to logs/healing_actions.csv (+ MTTR)   │
-        │  LOG/LEARN │───────────────────────────────────────────────────►┘
-        └────────────┘   (feedback dataset for future retraining)
-```
-
-Code path: `main.py --run` -> `SelfHealingEngine.run()`
-(`healing/self_healing_engine.py:118`) -> for each pod `process_pod(row)`
-(`self_healing_engine.py:53`).
-
-### Why three detectors plus a rule (defence in depth)
-
-No single detector catches every failure mode, so the engine combines
-complementary signals. Each answers a different question:
-
-**Layer 1 — Z-Score (`ai/zscore_predictor.py`)**
-Keeps a rolling window (size `ZSCORE_WINDOW_SIZE`, default 20) of each pod's CPU
-and memory. For a new reading `x` it computes `z = (x - mean) / std`; if
-`|z| > ZSCORE_THRESHOLD` (default 2.5) it raises a warning. It detects a **spike
-relative to that pod's own recent baseline** — e.g. a pod that normally sits at
-5% CPU suddenly jumping to 45%. It reacts fast and is pod-specific, but needs a
-few samples of history to be meaningful.
-
-**Layer 2 — Isolation Forest (`ai/isolation_forest_detector.py`)**
-An unsupervised anomaly detector trained only on *healthy* samples. It isolates
-outliers by random partitioning (fewer splits to isolate = more anomalous), with
-`IF_CONTAMINATION` (0.05) setting the outlier threshold. It detects **absolute
-resource anomalies** — e.g. memory at 90% is abnormal regardless of the pod's
-own history. It looks at **CPU and memory only** (see design note below).
-
-**Layer 2b — Explicit health gate (`self_healing_engine.py:73-86`)**
-A deterministic rule, not a model. It fires on:
-- `restart_spike` — `restart_count` increased since the previous poll (the
-  container was restarted, e.g. by a failing liveness probe), or
-- `not_ready_regression` — the pod was Ready before and is now not-ready.
-
-These are the crash / hang / stuck signals that do **not** show up in CPU/mem.
-
-**Layer 3 — Random Forest (`ai/random_forest_classifier.py`)**
-A supervised classifier trained on four labelled classes (healthy, CPU overload,
-memory pressure, crash). Given `cpu, memory, restart_count, pod_ready` it outputs
-**which action** to take and a **confidence**. It only counts if confidence
->= `RF_CONFIDENCE_MIN` (0.70).
-
-### The decision gate (`self_healing_engine.py:92`)
-
-```python
-should_act = zscore_warn or if_anomaly or health_degraded      # "is something wrong?"
-if should_act and rf_action != NO_ACTION and not in_cooldown:  # "and what do we do?"
-    execute(rf_action, pod)
-```
-
-This is a deliberate **two-key rule**: one set of signals decides *that* a pod is
-unhealthy (any of Z-Score / Isolation Forest / health gate), and a separate model
-decides *what* to do (Random Forest). A single noisy reading cannot cause an
-action on its own — the classifier must also agree with a concrete, confident
-remedy. The per-pod `COOLDOWN_SECONDS` (180s) then prevents repeated action on
-the same pod while a fix takes effect.
-
-### The three healing actions (`healing/kubernetes_actions.py`)
-
-| Action | Trigger (typical) | What the engine does | K8s effect |
-|--------|-------------------|----------------------|-----------|
-| **SCALE_UP** | Sustained high CPU | `scale_up_deployment()` patches `spec.replicas` +1 (capped at `MAX_REPLICAS`) | A new replica is scheduled to share load |
-| **ROLLING_RESTART** | Memory pressure / leak | `rolling_restart_deployment()` patches a `kubectl.kubernetes.io/restartedAt` annotation on the pod template | Deployment does a **zero-downtime** rolling update (`maxUnavailable: 0, maxSurge: 1`) — new pods come up before old ones go |
-| **DELETE_AND_RECREATE** | Crash / stuck / not-ready | `delete_pod()` deletes the pod (grace period 0) | The Deployment's ReplicaSet immediately recreates a fresh pod |
-
-### MTTR and the feedback loop
-
-When an action succeeds, the engine records **MTTR** (time to execute the
-remedy) and appends a full row to `logs/healing_actions.csv`
-(`healing/feedback_logger.py`). Every poll logs one row per pod — including
-`NO_ACTION` — so the CSV is both an audit trail and a labelled dataset that can be
-fed back into `--train` to improve the models over time.
-
-### Worked examples (from real demo runs)
-
-**1) Memory pressure -> ROLLING_RESTART.** A pod's memory was driven to ~90%.
-The Isolation Forest flagged it; the Random Forest chose `ROLLING_RESTART`; the
-healthy sibling pod was untouched:
-```
-pod    cpu    mem     rst rdy  if_anomaly  rf_action        conf  taken            mttr
-q2t25  0.32   90.41   1   1    True        ROLLING_RESTART  0.96  ROLLING_RESTART  0.02s   <- healed
-fp6m2  0.20   20.58   0   1    False       NO_ACTION        1.00  NO_ACTION        -       <- left alone
-```
-New pods from a fresh ReplicaSet replaced the stressed pods with **zero
-downtime**.
-
-**2) Crash -> DELETE_AND_RECREATE.** `/health` was forced to 503. Kubernetes'
-liveness probe restarted the container (restart_count 0->1, briefly not-ready).
-Note the resource metrics are **normal** — the Isolation Forest correctly stayed
-silent; the **health gate** drove the action:
-```
-pod    cpu    mem     rst rdy  if_anomaly  rf_action            conf  taken                mttr
-7jdnp  0.21   20.59   1   0    False       DELETE_AND_RECREATE  0.95  DELETE_AND_RECREATE  0.02s
-```
-
-**3) CPU overload -> HPA (not the AI).** Under CPU stress the pod's `cpu_percent`
-plateaued near ~46% because the container's CPU **limit is 500m** (`rate*100`
-caps around 50%), which is below the Random Forest's overload profile (~88%). So
-the AI `SCALE_UP` did not fire; the native **HorizontalPodAutoscaler** scaled the
-Deployment 2 -> 5 instead. To demo the AI scale-up path, raise the CPU limit so
-`cpu_percent` can exceed the overload threshold.
-
-### AI self-healing vs. Kubernetes' native self-healing
-
-Kubernetes already self-heals in basic ways; this engine **adds a layer on top**:
-
-| Concern | Kubernetes native | This AI engine adds |
-|---------|-------------------|---------------------|
-| Dead container | Liveness probe restarts it | Detects the restart and can escalate to `DELETE_AND_RECREATE` |
-| Not-ready pod | Removed from Service endpoints | Treats a *regression* to not-ready as a fault to remediate |
-| High CPU | HPA scales on CPU vs. request | Multi-signal detection; chooses among several remedies |
-| Memory leak | (no native remedy) | `ROLLING_RESTART` to clear it before OOM |
-| Which fix to apply | n/a | Random Forest classifier picks the action |
-| Audit / MTTR / learning | limited | Full CSV log + feedback dataset |
-
-Because both loops act on the same pods, the engine is intentionally designed
-**not to fight** Kubernetes — e.g. it does not treat freshly-created (still
-starting) pods as crashed (see the health-gate design note).
-
-### Tuning the healing behaviour (`config.py`)
-
-| Knob | Effect on healing |
-|------|-------------------|
-| `POLL_INTERVAL_SECONDS` | How quickly faults are detected (lower = faster, noisier) |
-| `COOLDOWN_SECONDS` | Minimum gap between actions on the same pod |
-| `ZSCORE_THRESHOLD` / `ZSCORE_WINDOW_SIZE` | Sensitivity of the spike detector |
-| `IF_CONTAMINATION` | How aggressively the Isolation Forest flags anomalies |
-| `RF_CONFIDENCE_MIN` | Minimum confidence before an action is taken |
-| `MAX_REPLICAS` | Upper bound for `SCALE_UP` |
-
 
 ## The AI models
 
@@ -508,67 +244,42 @@ Applied in numeric order with `kubectl apply -f kubernetes/`:
 | File | Creates |
 |------|---------|
 | `01-namespace.yaml` | `monitoring` namespace |
-| `02-app-deployment.yaml` | `task-manager` Deployment (probes, 256Mi/500m limits), NodePort Service (30080), HPA (2–5 replicas, target 70% CPU) |
+| `02-app-deployment.yaml` | `task-manager` Deployment (non-root `securityContext`, probes, 256Mi/500m limits), NodePort Service (30080), HPA (2–5 replicas, target 70% CPU) |
 | `03-prometheus-rbac.yaml` | Prometheus ServiceAccount + ClusterRole/Binding |
 | `04-prometheus-config.yaml` | Prometheus scrape configuration (ConfigMap) |
 | `05-prometheus-deploy.yaml` | Prometheus Deployment + NodePort Service (30090) |
-| `06-grafana-deploy.yaml` | Grafana Deployment + NodePort Service (30030), admin/admin123 |
-| `07-stress-pod.yaml` | `stress-tester` curl helper pod |
+| `06-grafana-deploy.yaml` | `grafana-admin-credentials` Secret + Grafana Deployment (reads the Secret, no plaintext) + NodePort Service (30030) |
+| `07-stress-pod.yaml` | `stress-tester` curl helper pod (non-root `securityContext`) |
+| `08-grafana-dashboard.yaml` | Self-healing Grafana dashboard, provisioned automatically |
 
 ---
 
-## Setup and run (end to end)
+## Quick start
 
-### Prerequisites
-Python 3.11, minikube (Docker driver), kubectl, Docker.
+Full step-by-step with expected output at each stage lives in
+[`ARCHITECTURE.md`](ARCHITECTURE.md#run-every-service-locally-in-order). Short
+version:
 
-### 1. Python environment
 ```bash
-python3.11 -m venv venv
-source venv/bin/activate
+python3.11 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
 
-### 2. Start the cluster
-```bash
 minikube start
-```
 
-### 3. Build the app image INTO minikube
-The Deployment uses `imagePullPolicy: Never`, so the image must live in
-minikube's Docker daemon:
-```bash
-eval "$(minikube docker-env)"        # point docker CLI at minikube
-docker build -t task-manager:latest app/
-eval "$(minikube docker-env -u)"     # (optional) revert your shell
-```
-Rebuild + roll after any change to `app/`:
-```bash
-eval "$(minikube docker-env)"; docker build -t task-manager:latest app/
-kubectl rollout restart deployment/task-manager -n default
-```
+eval "$(minikube docker-env)"
+docker build -t task-manager:1.0.0 app/
+eval "$(minikube docker-env -u)"
 
-### 4. Deploy everything
-```bash
 kubectl apply -f kubernetes/
-kubectl get pods -A -w        # wait until all are Running/Ready
-```
+kubectl get pods -A -w        # wait for everything Running/Ready
 
-### 5. Train the models
-```bash
 python main.py --train
-```
 
-### 6. Run the engine (needs Prometheus reachable)
-```bash
 kubectl port-forward -n monitoring svc/prometheus 9090:9090 &
 python main.py --run
-```
 
-### 7. Open the web app
-```bash
 kubectl port-forward -n default svc/task-manager 8080:80 &
-# then open http://localhost:8080
+# open http://localhost:8080
 ```
 
 ---
@@ -600,15 +311,31 @@ kubectl get pods -n default -l app=task-manager -w
 tail -f logs/healing_actions.csv
 ```
 
-What to expect:
+What to expect (all verified live — see the checklist in
+[`ARCHITECTURE.md`](ARCHITECTURE.md#feature-verification-checklist)):
 - **memory** -> ~90% memory -> Isolation Forest flags it -> `ROLLING_RESTART`.
 - **crash** -> `/health` 503 -> liveness restart + engine `DELETE_AND_RECREATE`.
 - **cpu** -> capped at ~50% by the 500m CPU limit, so the AI `SCALE_UP` path may
   not trigger; the native **HPA** scales instead. (Raise the CPU limit to make
   the AI `SCALE_UP` demonstrable.)
 
-Note: because gunicorn now runs **1 worker**, `crash`/`not-ready` flip the state
+Note: because gunicorn runs **1 worker**, `crash`/`not-ready` flip the state
 in a single call (no need to repeat).
+
+---
+
+## Testing
+
+```bash
+python -m pytest -v
+```
+
+`tests/test_app.py` covers the Flask API (CRUD, health/ready/stress/reset,
+metrics content-type) via Flask's test client — no cluster needed.
+`tests/test_healing_logic.py` covers the Z-Score predictor and the engine's
+decision gate (should-act, cooldown, the not-ready/`starting_up` guards) with
+the ML models and Kubernetes API stubbed out — no trained `.pkl` files or live
+cluster needed either.
 
 ---
 
@@ -625,8 +352,8 @@ kubectl port-forward -n monitoring svc/grafana      3000:3000 &
 python main.py --run          # engine terminal (keep visible)
 ```
 Open three tabs: the app (`http://localhost:8080`), the Grafana dashboard
-(`http://localhost:3000/d/selfhealing`, admin/admin123), and the engine terminal.
-Keep a spare terminal for stress commands and `kubectl` watch.
+(`http://localhost:3000/d/selfhealing`, admin + your password), and the engine
+terminal. Keep a spare terminal for stress commands and `kubectl` watch.
 
 **Script:**
 1. **Show the app.** "This is *My Task Flow*, a Flask app running as pods in
@@ -660,45 +387,7 @@ Keep a spare terminal for stress commands and `kubectl` watch.
 kubectl exec -n default stress-tester -- curl -s http://task-manager/stress/reset
 ```
 
-## Observability
-
-On the Docker driver these NodePorts are not directly routable from the host;
-use `kubectl port-forward` (or `minikube service <name> -n monitoring --url`).
-
-| Service | NodePort | Access |
-|---------|----------|--------|
-| task-manager (web app) | 30080 | `kubectl port-forward -n default svc/task-manager 8080:80` |
-| Prometheus | 30090 | `kubectl port-forward -n monitoring svc/prometheus 9090:9090` |
-| Grafana | 30030 | `kubectl port-forward -n monitoring svc/grafana 3000:3000` (admin/admin123) |
-
 ---
-
-### Self-healing Grafana dashboard
-
-A ready-made dashboard is **provisioned automatically** — the Prometheus
-datasource and the dashboard are defined in `kubernetes/08-grafana-dashboard.yaml`
-and mounted into Grafana by `kubernetes/06-grafana-deploy.yaml`. No manual import
-needed.
-
-```bash
-kubectl port-forward -n monitoring svc/grafana 3000:3000
-# open http://localhost:3000/d/selfhealing   (admin / admin123)
-```
-
-Panels (all from Prometheus):
-
-| Panel | What it shows during a demo |
-|-------|-----------------------------|
-| **Per-pod CPU %** | Jumps during CPU stress |
-| **Per-pod Memory % of 256Mi** | Climbs during memory stress, **drops after a rolling restart** |
-| **Running pods** | Increases on `SCALE_UP`; changes as pods roll / are recreated |
-| **Tasks in store** | Live app state |
-| **HTTP request rate by status** | Traffic + any 5xx during disruption |
-| **p95 latency / Error rate** | Impact on the app while a pod is unhealthy |
-
-The dashboard visualizes the **effects** of healing (recovery, pod turnover) from
-Prometheus. The healing **decisions** themselves (which action, confidence, MTTR)
-are recorded in `logs/healing_actions.csv` — see the feedback log.
 
 ## Configuration
 
@@ -718,47 +407,6 @@ are recorded in `logs/healing_actions.csv` — see the feedback log.
 
 ---
 
-## Environment notes (corporate network / Zscaler)
-
-This project was set up on a corporate machine behind **Zscaler** (a TLS-
-intercepting proxy). Two consequences worth knowing for a fresh setup:
-
-1. **The minikube node could not pull `registry.k8s.io` images** (e.g.
-   `metrics-server`) — error: `x509: certificate signed by unknown authority`.
-   Zscaler re-signs HTTPS with its own root CA, which the minikube node did not
-   trust.
-   **Durable fix applied:** export the Zscaler Root CA from the macOS keychain to
-   `~/.minikube/certs/` and reprovision so minikube installs it into the node:
-   ```bash
-   security find-certificate -a -c "Zscaler" -p /Library/Keychains/System.keychain \
-     > ~/.minikube/certs/zscaler-root-ca.pem
-   minikube start   # installs certs from ~/.minikube/certs into the node
-   ```
-   minikube re-syncs that folder on every `minikube start`, so it stays fixed.
-   After this, `registry.k8s.io` / Docker Hub / gcr.io pulls all work.
-
-2. The AI engine itself does **not** depend on `metrics-server` (it uses
-   Prometheus). `metrics-server` only powers `kubectl top` and the HPA.
-
----
-
-## Troubleshooting
-
-- **`--run` says "No pods found" / Prometheus errors** — ensure the Prometheus
-  `kubectl port-forward` is running and `minikube status` is healthy.
-- **App pod `ErrImageNeverPull` / `ImagePullBackOff`** — the image is not in
-  minikube's Docker daemon; redo `eval "$(minikube docker-env)"; docker build`.
-- **Tasks vanish on reload** — a symptom of multiple gunicorn workers; the
-  Dockerfile is set to `--workers 1` to prevent this. Rebuild if you changed it.
-- **Web page pod name never changes on reload** — `kubectl port-forward svc/...`
-  pins to one pod; it changes when that pod is actually replaced by a heal. If a
-  heal deletes the pinned pod, re-run the port-forward.
-- **`metrics-server` `ImagePullBackOff`** — see the Zscaler note above.
-- **HPA shows `unknown` CPU** — `metrics-server` isn't ready; healing still works
-  regardless (engine uses Prometheus).
-
----
-
 ## Known limitations and future work
 
 - **In-memory task store** — tasks reset when a pod is replaced. Add Redis or a
@@ -771,3 +419,7 @@ intercepting proxy). Two consequences worth knowing for a fresh setup:
   Splitting into `templates/`/`static/` (or a separate SPA) would be cleaner.
 - **Synthetic training data** — replace with the real `logs/healing_actions.csv`
   feedback to close the learning loop.
+- **Engine runs as a host process with your local kubeconfig** rather than
+  in-cluster with its own least-privilege ServiceAccount — see
+  [`ARCHITECTURE.md`](ARCHITECTURE.md#what-production-ready-means-here--and-what-it-deliberately-excludes)
+  for why that's out of scope for now.
