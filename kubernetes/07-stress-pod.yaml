@@ -14,6 +14,13 @@
 #
 # Note: the app runs a single gunicorn worker (see app/Dockerfile), so one
 # call to /stress/crash or /stress/not-ready is enough to flip its state.
+#
+# restartPolicy: Always -- this pod is not managed by a Deployment/ReplicaSet
+# and is out of scope for the self-healing engine (which only watches
+# TARGET_DEPLOYMENT), so if its container is ever killed (e.g. a minikube
+# VM restart), kubelet's own native restart is what brings it back, not the
+# AI. A bare Pod with restartPolicy: Never would otherwise be left dead
+# permanently with nothing to recreate it.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -23,7 +30,7 @@ metadata:
     app: stress-tester
     purpose: load-generation
 spec:
-  restartPolicy: Never
+  restartPolicy: Always
   securityContext:
     runAsNonRoot: true
     runAsUser: 100
